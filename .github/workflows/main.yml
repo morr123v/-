@@ -1,0 +1,111 @@
+name: Full Stack - RDP - Tailscale - Pentest Copilot (with Funnel)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_HOSTNAME: full-stack-${{ github.run_id }}
+      PENTEST_DIR: /opt/pentest-copilot
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- Desktop Environment (XFCE) ----------
+      - name: Install XFCE and xrdp (kept for optional RDP within tailnet)
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfce4 xfce4-goodies xorg dbus-x11 xrdp
+          echo "startxfce4" | sudo tee /home/${USERNAME}/.xsession
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+          sudo systemctl enable --now xrdp
+          sudo systemctl restart xrdp
+
+      - name: Set user password and sudo
+        run: |
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+
+      # ---------- Tailscale ----------
+      - name: Install and Connect Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+
+      # ---------- noVNC (Web-based desktop for Funnel) ----------
+      - name: Install noVNC and x11vnc
+        run: |
+          sudo apt-get install -y -qq x11vnc websockify novnc
+          # Start x11vnc on display :0 (with password)
+          x11vnc -storepasswd ${PASSWORD} /home/${USERNAME}/.vncpass
+          x11vnc -display :0 -auth guess -forever -loop -noxdamage -repeat -rfbauth /home/${USERNAME}/.vncpass -rfbport 5900 -shared &
+          # Start websockify to bridge VNC to WebSocket on port 6080
+          websockify --web /usr/share/novnc 6080 localhost:5900 &
+          echo "noVNC running on http://localhost:6080/vnc.html"
+
+      # ---------- Tailscale Funnel for noVNC ----------
+      - name: Enable Tailscale Funnel for noVNC
+        run: |
+          # Allow Tailscale to forward port 6080 (HTTP)
+          sudo tailscale serve --bg 6080
+          # Enable Funnel (public internet access)
+          sudo tailscale funnel 6080 on
+
+      # ---------- Pentest Copilot ----------
+      - name: Install Pentest Copilot
+        run: |
+          git clone https://github.com/bugbasesecurity/pentest-copilot.git ${PENTEST_DIR}
+          cd ${PENTEST_DIR}
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install .
+          fi
+          cat > config.yaml << 'EOF'
+          # llm:
+          #   provider: openai
+          #   api_key: YOUR_API_KEY
+          #   model: gpt-4
+          EOF
+          if [ -f pentest-copilot.py ]; then
+            chmod +x pentest-copilot.py
+            ln -s ${PENTEST_DIR}/pentest-copilot.py /usr/local/bin/pentest-copilot
+          elif [ -f main.py ]; then
+            chmod +x main.py
+            ln -s ${PENTEST_DIR}/main.py /usr/local/bin/pentest-copilot
+          fi
+
+      # ---------- Connection Information ----------
+      - name: Connection Information
+        run: |
+          TS_IP=$(sudo tailscale ip -4 | head -n1 | tr -d ' ')
+          FUNNEL_URL=$(sudo tailscale funnel status --json | jq -r '.FunnelDomains[0] // "Check Tailscale admin console"')
+          echo "============================================================"
+          echo "                FULL STACK IS READY                         "
+          echo "============================================================"
+          echo "TAILSCALE RDP (within your tailnet):"
+          echo "  Address: ${TS_IP}:3389"
+          echo "  Username: ${USERNAME}"
+          echo "  Password: ${PASSWORD}"
+          echo ""
+          echo "PUBLIC WEB DESKTOP (Tailscale Funnel):"
+          echo "  URL: ${FUNNEL_URL}/vnc.html"
+          echo "  Password: ${PASSWORD}"
+          echo ""
+          echo "PENTEST COPILOT:"
+          echo "  Installed at ${PENTEST_DIR}"
+          echo "  Connect via RDP or Web Desktop, edit config.yaml"
+          echo "  Then run: pentest-copilot --help"
+          echo "============================================================"
+
+      # ---------- Keep Alive ----------
+      - name: Keep Runner Alive
+        run: while true; do sleep 600; done
