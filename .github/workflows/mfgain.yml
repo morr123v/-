@@ -1,0 +1,90 @@
+name: Full Stack - RDP - Tailscale - Pentest Copilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      USERNAME: runner
+      PASSWORD: runner
+      TAILSCALE_HOSTNAME: full-stack-${{ github.run_id }}
+      PENTEST_DIR: /opt/pentest-copilot
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- RDP (XFCE) ----------
+      - name: Install XFCE and xrdp
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfce4 xfce4-goodies xorg dbus-x11 xrdp
+          echo "startxfce4" | sudo tee /home/${USERNAME}/.xsession
+          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession
+          sudo systemctl enable --now xrdp
+          sudo systemctl restart xrdp
+
+      - name: Set user password and sudo
+        run: |
+          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+
+      # ---------- Tailscale (private network only) ----------
+      - name: Install and Connect Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+
+      # ---------- Pentest Copilot ----------
+      - name: Install Pentest Copilot
+        run: |
+          git clone https://github.com/bugbasesecurity/pentest-copilot.git ${PENTEST_DIR}
+          cd ${PENTEST_DIR}
+          # Install Python dependencies
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install .
+          fi
+          # Create a minimal config (no local Ollama; you must provide an API key later)
+          cat > config.yaml << 'EOF'
+          # llm:
+          #   provider: openai
+          #   api_key: YOUR_API_KEY
+          #   model: gpt-4
+          EOF
+          # Make the main script globally accessible (adjust name if different)
+          if [ -f pentest-copilot.py ]; then
+            chmod +x pentest-copilot.py
+            ln -s ${PENTEST_DIR}/pentest-copilot.py /usr/local/bin/pentest-copilot
+          elif [ -f main.py ]; then
+            chmod +x main.py
+            ln -s ${PENTEST_DIR}/main.py /usr/local/bin/pentest-copilot
+          fi
+
+      # ---------- Connection Information ----------
+      - name: Connection Information
+        run: |
+          TS_IP=$(sudo tailscale ip -4 | head -n1 | tr -d ' ')
+          echo "============================================================"
+          echo "                FULL STACK IS READY                         "
+          echo "============================================================"
+          echo "RDP CONNECTION (via Tailscale):"
+          echo "  Address: ${TS_IP}:3389"
+          echo "  Username: ${USERNAME}"
+          echo "  Password: ${PASSWORD}"
+          echo ""
+          echo "PENTEST COPILOT:"
+          echo "  Installed at /opt/pentest-copilot"
+          echo "  Connect via RDP and edit config.yaml to set your LLM API"
+          echo "  Then run: pentest-copilot --help"
+          echo "============================================================"
+
+      # ---------- Keep Alive ----------
+      - name: Keep Runner Alive
+        run: while true; do sleep 600; done
